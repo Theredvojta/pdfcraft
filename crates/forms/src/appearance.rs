@@ -8,7 +8,9 @@
 //! The `/DA` font is used when the form's `/DR` defines it as a simple font that can encode the
 //! displayed text (using its own encoding and Differences), or as a composite font with a
 //! predefined Unicode CMap such as `UniJIS-UTF16-H`, as Japanese forms use. Otherwise (unsupported
-//! characters, other composite fonts, missing resources) Helvetica is used. Text the chosen font
+//! characters, other composite fonts, missing resources) Helvetica is used, or, for text Helvetica
+//! can't show either (Czech `ř`, Cyrillic, `⁻`), the Unicode font (Inter) that filling such a
+//! value embeds once in the form's `/DR` (`author::add_unicode_font`). Text the chosen font
 //! can't hold (outside WinAnsi in Helvetica, or beyond U+FFFF in a UCS-2 CMap) is drawn as `?`, as
 //! Acrobat keeps a value its field font can't show: the value itself is stored as typed,
 //! [`field_appearance_drawn`] returns the first such character, and the caller marks the widget
@@ -365,6 +367,33 @@ fn dr_font(doc: &Document, name: &str) -> Option<(Object, FontText)> {
         return None;
     }
     Some((entry, FontText::Simple(Box::new(Metrics::from_dict(doc, fd)))))
+}
+
+/// The family of the font PdfCraft embeds in the form's `/DR` for values the field's own font
+/// can't show (see `author::add_unicode_font`): the bundled, OFL-licensed Inter Regular, which has
+/// Latin (all of Czech, Slovak, Polish, …), Greek, Cyrillic and many symbols.
+pub(crate) const UNICODE_FONT: &str = "Inter";
+
+/// That font, when the form's `/DR` has it: its resource name, the object and its encoding.
+fn unicode_font(doc: &Document) -> Option<(String, Object, FontText)> {
+    let af = acroform(doc)?;
+    let dr = doc.resolve(af.get(b"DR")?);
+    let fonts = doc.resolve(dr.as_dict()?.get(b"Font")?);
+    // Only the `PCFull` resources the embedding writes; a bounded look in a hostile `/DR`.
+    fonts.as_dict()?.iter().filter(|(k, _)| k.starts_with(b"PCFull")).take(64).find_map(|(k, v)| {
+        let font = doc.resolve(v);
+        let fd = font.as_dict()?;
+        if fd.name(b"Subtype") != Some(b"Type0") || fd.name(b"BaseFont") != Some(UNICODE_FONT.as_bytes()) {
+            return None;
+        }
+        let name = String::from_utf8(k.clone()).ok()?;
+        Some((name, v.clone(), FontText::Simple(Box::new(Metrics::from_dict(doc, fd)))))
+    })
+}
+
+/// Whether the form's `/DR` has the font of [`UNICODE_FONT`].
+pub(crate) fn has_unicode_font(doc: &Document) -> bool {
+    unicode_font(doc).is_some()
 }
 
 /// A push button's caption, centered in a `width` × `height` box, in the font, size and color its
@@ -774,9 +803,24 @@ fn field_appearance_fit(doc: &Document, f: &Field, w: &Widget, values: &[String]
             enc.can_encode(&text)
         }
     };
+    // What is drawn, line by line: every option of a list box, each line of multiline text, and
+    // otherwise the value on one line (a line break there is drawn as a space).
+    let drawn_lines: Vec<String> = if f.kind == FieldKind::List {
+        f.options.iter().map(|(_, display)| display.clone()).collect()
+    } else if f.kind == FieldKind::Text && f.has(flags::MULTILINE) {
+        text.split(['\n', '\r']).map(str::to_string).collect()
+    } else {
+        vec![text.replace(['\n', '\r'], " ")]
+    };
+    let holds_all = |enc: &FontText| drawn_lines.iter().all(|l| enc.can_encode(l) && enc.first_unencodable(l).is_none());
     let (font_name, font_obj, enc) = match dr_font(doc, &da.font).filter(|(_, enc)| can_show(enc)) {
         Some((o, enc)) => (da.font.clone(), o, enc),
-        None => ("Helv".to_string(), helvetica(), FontText::WinAnsi),
+        // Helvetica when it can show it all, as Acrobat does; else the form's embedded Unicode
+        // font when it can, so `ř` or `⁻` is drawn and not `?`.
+        None => match unicode_font(doc).filter(|(_, _, enc)| !holds_all(&FontText::WinAnsi) && holds_all(enc)) {
+            Some((name, o, enc)) => (name, o, enc),
+            None => ("Helv".to_string(), helvetica(), FontText::WinAnsi),
+        },
     };
     let width_of = |text: &str, size: f64| enc.width(text, size);
     let (mut c, bw) = frame(doc, &wd, width, height);

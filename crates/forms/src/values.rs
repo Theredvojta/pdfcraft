@@ -427,10 +427,17 @@ fn redraw(doc: &mut Document, f: &Field, values: &[String], scripts: &mut dyn Sc
     let in_place = f.kind == FieldKind::Text && f.has(flags::PASSWORD);
     let mut undrawn = false;
     for w in &f.widgets {
-        let (stream, missing) = match &shown {
+        let draw = |doc: &Document| match &shown {
             Some(s) => appearance::field_appearance_drawn(doc, f, w, std::slice::from_ref(s), false),
             None => appearance::field_appearance_drawn(doc, f, w, values, true),
         };
+        let (mut stream, mut missing) = draw(doc);
+        // A character the field's font and Helvetica lack: embed the Unicode font and draw again.
+        if let Some(ch) = missing
+            && author::add_unicode_font(doc, ch)?
+        {
+            (stream, missing) = draw(doc);
+        }
         undrawn |= missing.is_some();
         let existing_ap = in_place
             .then(|| {

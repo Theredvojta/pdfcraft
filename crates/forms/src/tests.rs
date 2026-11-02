@@ -989,6 +989,75 @@ fn a_pdfa_form_keeps_the_value_without_asking_viewers_to_redraw() {
     assert!(!need_appearances(&doc), "PDF/A forbids /NeedAppearances");
 }
 
+/// A value Helvetica can't show but the bundled Unicode font can (Czech `ř`, `ě`, `ů`, `⁻`) is
+/// drawn with its real glyphs: filling it embeds Inter once in the form's `/DR`, every field that
+/// needs it shares that one font, nothing is marked and other viewers aren't asked to redraw.
+/// WinAnsi text stays in Helvetica, and a character Inter lacks too (Chinese) is still `?`.
+#[test]
+fn czech_and_symbol_values_are_drawn_with_the_embedded_unicode_font() {
+    let objs: Vec<String> = vec![
+        "<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>".into(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 600 800] >>".into(),
+        "<< /Type /Page /Parent 2 0 R /Annots [6 0 R 7 0 R 8 0 R] >>".into(),
+        "<< /Fields [6 0 R 7 0 R 8 0 R] /DA (/Helv 0 Tf 0 g) /DR << /Font << /Helv 5 0 R >> >> >>".into(),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".into(),
+        "<< /Type /Annot /Subtype /Widget /FT /Tx /T (name) /DA (/Helv 10 Tf 0 g) /Rect [50 700 250 715] /P 3 0 R >>".into(),
+        "<< /Type /Annot /Subtype /Widget /FT /Tx /T (unit) /DA (/Helv 10 Tf 0 g) /Rect [50 600 250 615] /P 3 0 R >>".into(),
+        "<< /Type /Annot /Subtype /Widget /FT /Tx /T (note) /Ff 4096 /DA (/Helv 10 Tf 0 g) /Rect [50 400 250 500] /P 3 0 R >>".into(),
+    ];
+    let mut doc = document(&objs);
+    let shown = |doc: &Document, name: &str| {
+        let all = fields(doc);
+        let w = &field(&all, name).widgets[0];
+        let n = doc.get(w.obj).as_dict().unwrap().get(b"AP").unwrap().as_dict().unwrap().reference(b"N").unwrap();
+        let Object::Stream(s) = &*doc.get(n) else { panic!() };
+        let fonts = doc.resolve(s.dict.get(b"Resources").unwrap()).as_dict().unwrap().get(b"Font").map(|f| doc.resolve(f)).unwrap();
+        let font = fonts.as_dict().unwrap().iter().next().map(|(k, v)| (String::from_utf8_lossy(k).into_owned(), v.clone())).unwrap();
+        let mark = doc.get(w.obj).as_dict().and_then(pdfcraft_fonts::undrawn_mark);
+        (s.decoded().unwrap(), font, mark)
+    };
+    let programs =
+        |doc: &Document| doc.scan_objects().filter(|(_, o)| matches!(o.as_ref(), Object::Stream(s) if s.dict.get(b"PCFullFont").is_some())).count();
+    // WinAnsi text (á, é, š, ž are in it) stays Helvetica and adds no font.
+    set_value(&mut doc, "name", &FieldValue::Text("Šárka Žížalová".into())).unwrap();
+    assert_eq!(shown(&doc, "name").1.0, "Helv");
+    assert_eq!(programs(&doc), 0);
+    // Czech letters outside WinAnsi: drawn in Inter, decoded back to the value, unmarked.
+    set_value(&mut doc, "name", &FieldValue::Text("Vojtěch Navrátil, Řečkovice 2ů".into())).unwrap();
+    let (ap, (font, font_obj), mark) = shown(&doc, "name");
+    assert!(font.starts_with("PCFull"), "{font}");
+    assert_eq!(mark, None);
+    assert!(!ap.windows(3).any(|x| x == b"(?)") && !String::from_utf8_lossy(&ap).contains('?'), "{}", String::from_utf8_lossy(&ap));
+    let font_dict = doc.dict(&font_obj).unwrap();
+    assert_eq!(font_dict.name(b"BaseFont"), Some(&b"Inter"[..]));
+    let metrics = pdfcraft_fonts::pdf::Metrics::from_dict(&doc, &font_dict);
+    assert!(ap.windows(metrics.encode("Řečkovice").unwrap().len()).any(|x| x == metrics.encode("Řečkovice").unwrap().as_slice()));
+    assert!(!need_appearances(&doc), "nothing for other viewers to redraw");
+    assert_eq!(programs(&doc), 1);
+    // In /DR, and shared: another field (a superscript minus) and a multiline one reuse it.
+    let dr_fonts = |doc: &Document| -> Vec<String> {
+        let af = doc.dict(doc.get(doc.root().unwrap()).as_dict().unwrap().get(b"AcroForm").unwrap()).unwrap();
+        let dr = doc.dict(af.get(b"DR").unwrap()).unwrap();
+        doc.dict(dr.get(b"Font").unwrap()).unwrap().iter().map(|(k, _)| String::from_utf8_lossy(k).into_owned()).collect()
+    };
+    assert_eq!(dr_fonts(&doc), ["Helv".to_string(), font.clone()]);
+    set_value(&mut doc, "unit", &FieldValue::Text("m·s⁻²".into())).unwrap();
+    let (_, (unit_font, _), unit_mark) = shown(&doc, "unit");
+    assert_eq!((unit_font, unit_mark), (font.clone(), None));
+    set_value(&mut doc, "note", &FieldValue::Text("Příliš žluťoučký\nkůň úpěl ďábelské ódy".into())).unwrap();
+    let (_, (note_font, _), note_mark) = shown(&doc, "note");
+    assert_eq!((note_font, note_mark), (font.clone(), None));
+    assert_eq!(programs(&doc), 1);
+    assert_eq!(dr_fonts(&doc).len(), 2);
+    // A character Inter lacks too: Helvetica and `?`, marked, as before.
+    set_value(&mut doc, "unit", &FieldValue::Text("签名".into())).unwrap();
+    assert_eq!(shown(&doc, "unit").2, Some('签'));
+    // Kept through a save.
+    let doc = reopen(&doc);
+    assert_eq!(field(&fields(&doc), "name").value, ["Vojtěch Navrátil, Řečkovice 2ů"]);
+    assert_eq!(shown(&doc, "name").1.0, font);
+}
+
 /// A button caption Helvetica can't draw is kept and marked like a value; redrawing a value another
 /// program stored (a dynamic form's layout, a property change) draws and marks it rather than
 /// failing, and an edit to an unrelated field never fails because of it.
