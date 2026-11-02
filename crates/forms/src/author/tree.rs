@@ -83,33 +83,68 @@ fn store_form_fonts(doc: &mut Document, af: &mut Dict, mut dr: Dict, fonts: Dict
 /// Not in a form a signature covers: there the file stays as the signer saw it, apart from the
 /// value itself.
 pub(crate) fn form_fonts_as_objects(doc: &mut Document, all: &[crate::Field]) -> Result<(), FormError> {
-    let signed = all.iter().any(|f| f.kind == crate::FieldKind::Signature && holds_value(doc, f.obj));
-    if signed {
+    if signed(doc, all) {
         return Ok(());
     }
-    let Some(root) = doc.root() else { return Ok(()) };
-    let Some(entry) = doc.get(root).as_dict().and_then(|c| c.get(b"AcroForm").cloned()) else { return Ok(()) };
+    edit_form_fonts(doc, inline_fonts_as_objects)?;
+    Ok(())
+}
+
+/// Embed PdfCraft's Unicode field font (Inter, see [`crate::appearance::UNICODE_FONT`]) in the
+/// form's `/DR`, so that a value the field's own font can't show — Czech `ř`, `ě`, `ů`, Polish
+/// `ł`, Cyrillic, Greek, `⁻` — is drawn with its real glyphs instead of `?`. Done once per
+/// document (the font is found in `/DR` afterwards and shared by every field), and only when the
+/// font has `ch`, so a character it lacks too doesn't add a font that wouldn't help. Not in a form
+/// a signature covers, which stays as the signer saw it apart from the values (the `?` stays
+/// there). Whether the font was added now.
+pub(crate) fn add_unicode_font(doc: &mut Document, ch: char) -> Result<bool, FormError> {
+    let bytes = pdfcraft_fonts::INTER_REGULAR;
+    if crate::appearance::has_unicode_font(doc) || !pdfcraft_fonts::embedding::covers(bytes, ch.encode_utf8(&mut [0; 4])) {
+        return Ok(false);
+    }
+    if signed(doc, &crate::fields(doc)) {
+        return Ok(false);
+    }
+    edit_form_fonts(doc, |doc, fonts| {
+        // Fails only on a font program that doesn't parse, which the bundled one does (tested);
+        // the value is then drawn with `?` as before.
+        pdfcraft_fonts::embedding::embed(doc, fonts, bytes, crate::appearance::UNICODE_FONT).is_ok()
+    })
+}
+
+/// Whether a signature field of `all` holds a value (the form is signed).
+fn signed(doc: &Document, all: &[crate::Field]) -> bool {
+    all.iter().any(|f| f.kind == crate::FieldKind::Signature && holds_value(doc, f.obj))
+}
+
+/// Run `change` on the form's `/DR /Font` dictionary and write it back when it says it changed
+/// it. Whether it did; nothing happens (false) in a document without a form dictionary.
+fn edit_form_fonts(doc: &mut Document, change: impl FnOnce(&mut Document, &mut Dict) -> bool) -> Result<bool, FormError> {
+    let Some(root) = doc.root() else { return Ok(false) };
+    let Some(entry) = doc.get(root).as_dict().and_then(|c| c.get(b"AcroForm").cloned()) else { return Ok(false) };
     match entry {
         Object::Ref(r) => {
-            let Some(mut af) = doc.get(r).as_dict().cloned() else { return Ok(()) };
+            let Some(mut af) = doc.get(r).as_dict().cloned() else { return Ok(false) };
             let (dr, mut fonts) = form_fonts(doc, &af);
-            if inline_fonts_as_objects(doc, &mut fonts) {
-                store_form_fonts(doc, &mut af, dr, fonts);
-                doc.set(r, Object::Dict(af));
+            if !change(doc, &mut fonts) {
+                return Ok(false);
             }
+            store_form_fonts(doc, &mut af, dr, fonts);
+            doc.set(r, Object::Dict(af));
         }
         // A form dictionary written directly in the catalog (the catalog's /AcroForm need not be
         // an indirect reference) is written back there.
         Object::Dict(mut af) => {
             let (dr, mut fonts) = form_fonts(doc, &af);
-            if inline_fonts_as_objects(doc, &mut fonts) {
-                store_form_fonts(doc, &mut af, dr, fonts);
-                doc.update_dict(root, |c| c.set(b"AcroForm".to_vec(), Object::Dict(af)))?;
+            if !change(doc, &mut fonts) {
+                return Ok(false);
             }
+            store_form_fonts(doc, &mut af, dr, fonts);
+            doc.update_dict(root, |c| c.set(b"AcroForm".to_vec(), Object::Dict(af)))?;
         }
-        _ => {}
+        _ => return Ok(false),
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Whether the field `r`, or the nearest ancestor that has one, holds a `/V` (the entry is
